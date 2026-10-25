@@ -1,0 +1,492 @@
+<script setup lang="ts">
+import { ref, onMounted, nextTick } from 'vue'
+import html2canvas from 'html2canvas'
+import { useRoute } from 'vue-router'
+import { initWechatJSSDK, chooseWechatImage, getWechatImageData  } from '@/utils/wechatScan'
+import { uploadWechatImageToCOS } from '@/utils/cosUpload'
+import { Toast } from 'vant'
+import { getUserInfoAPI, withdrawAPI, clearDrawInfoAPI } from '@/apis/user'
+import type { UserInfo } from '@/types/user'
+// import { configH5ToMp } from '@/utils/wechatLibrary';
+
+
+// 生成海报相关
+// 页面容器，用于生成合成图片
+const pageBodyRef = ref<HTMLElement | null>(null)
+// 最终合成的海报图片
+const posterUrl = ref('')
+
+/**
+ * 等待图片加载完成
+ */
+function waitForImage(img: HTMLImageElement): Promise<void> {
+  return new Promise((resolve) => {
+    if (img.complete && img.naturalWidth > 0) {
+      resolve()
+      return
+    }
+
+    img.onload = () => resolve()
+    img.onerror = () => resolve()
+  })
+}
+
+/**
+ * 等待 CSS 背景图片加载完成
+ */
+async function waitForBackgroundImages(element: HTMLElement) {
+  const elements = [
+    element,
+    ...Array.from(element.querySelectorAll<HTMLElement>('*')),
+  ]
+
+  const urls = new Set<string>()
+
+  elements.forEach((el) => {
+    const backgroundImage = getComputedStyle(el).backgroundImage
+
+    // 提取 background-image 中的 URL
+    const regex = /url\(["']?(.*?)["']?\)/g
+    let match: RegExpExecArray | null
+
+    while ((match = regex.exec(backgroundImage)) !== null) {
+      if (match[1]) {
+        urls.add(match[1])
+      }
+    }
+  })
+
+  await Promise.all(
+    Array.from(urls).map((url) => {
+      return new Promise<void>((resolve) => {
+        const img = new Image()
+        img.crossOrigin = 'anonymous'
+        img.onload = () => resolve()
+        img.onerror = () => resolve()
+        img.src = url
+
+        // 防止图片加载异常时一直等待
+        if (img.complete) {
+          resolve()
+        }
+      })
+    })
+  )
+}
+
+/**
+ * 将当前页面合成为一张高清海报
+ */
+async function generatePoster() {
+  await nextTick()
+
+  const element = pageBodyRef.value
+
+  if (!element) {
+    throw new Error('找不到海报容器')
+  }
+
+  // 1. 等待普通 img 加载
+  const images = Array.from(
+    element.querySelectorAll<HTMLImageElement>('img')
+  )
+
+  await Promise.all(images.map(waitForImage))
+
+  // 2. 等待 CSS 背景图片加载
+  await waitForBackgroundImages(element)
+
+  // 3. 记录实际截图尺寸
+  const width = element.clientWidth
+  const height = element.clientHeight
+
+  if (!width || !height) {
+    throw new Error('海报尺寸异常，请重新尝试')
+  }
+
+  // 4. 生成高清海报
+  const canvas = await html2canvas(element, {
+    scale: 3,
+
+    width,
+    height,
+
+    useCORS: true,
+    allowTaint: false,
+    backgroundColor: '#000000',
+    logging: false,
+
+    // 固定截图位置，避免滚动偏移
+    scrollX: 0,
+    scrollY: 0,
+
+    // 在截图副本中进行处理，不修改实际页面
+    onclone: (clonedDocument) => {
+      // 隐藏“提示长按保存”等提示元素
+      const tips = clonedDocument.querySelector('.tips') as HTMLElement | null
+
+      if (tips) {
+        tips.style.display = 'none'
+      }
+
+      // 确保截图副本中的照片容器尺寸正确
+      const photoContainer = clonedDocument.querySelector(
+        '.photo-container'
+      ) as HTMLElement | null
+
+      if (photoContainer) {
+        photoContainer.style.backgroundColor = 'transparent'
+      }
+    },
+  })
+
+  // 5. 导出高清 JPEG
+  posterUrl.value = canvas.toDataURL('image/jpeg', 1)
+}
+
+
+// 定义页面或元素显示
+const pageNum = ref(0)  // 0为上传界面，1为海报界面
+
+// 定义用户信息
+const userInfo = ref<UserInfo>()
+
+// 定义qrcode相关信息
+const flowStatus = ref('0')
+
+const route = useRoute()
+let auth_code;
+const loadUserInfo = async () => {
+    console.log("获取的参数信息为：", route.query);
+    if (route.query.authCode) {
+
+        auth_code = route.query.authCode as string
+        console.log("auth_code: ", auth_code)
+        const res = await getUserInfoAPI({ auth_code})           
+        console.log(res)
+        if (res.data.errcode == 0) {
+            userInfo.value = res.data.data
+            flowStatus.value = res.data.data!.flow_status!
+
+
+            // 状态记录
+            // if ('0' == res.data.data!.flow_status) { // 首次进入
+            //     // pageNum.value = 0 // 跳转到首页面
+            //     pageNum.value = 1   // 有Landing Page了不需要首页了
+            // } else {
+            //     pageNum.value = 1 // 跳转到抽奖页面
+            // }
+        } else {
+            Toast(res.data.errmsg)
+        }
+    } else {
+        Toast("参数不正确，请重新扫描太阳码进入~")
+    }
+}
+
+onMounted(() => loadUserInfo())
+
+/**
+ * 获取微信返回的图片实际尺寸
+ */
+function getImageDimensions(
+  localData: string
+): Promise<{ width: number; height: number }> {
+  return new Promise((resolve, reject) => {
+    let imageData = localData.trim()
+
+    // 如果微信返回的不是完整 Data URL，则补充图片格式前缀
+    if (!/^data:image\//i.test(imageData)) {
+      if (imageData.startsWith('iVBORw0KGgo')) {
+        imageData = `data:image/png;base64,${imageData}`
+      } else if (imageData.startsWith('/9j/')) {
+        imageData = `data:image/jpeg;base64,${imageData}`
+      } else {
+        reject(new Error('无法识别图片格式，请重新选择照片'))
+        return
+      }
+    }
+
+    const img = new Image()
+
+    img.onload = () => {
+      if (!img.naturalWidth || !img.naturalHeight) {
+        reject(new Error('无法读取图片尺寸'))
+        return
+      }
+
+      resolve({
+        width: img.naturalWidth,
+        height: img.naturalHeight,
+      })
+    }
+
+    img.onerror = () => {
+      reject(new Error('图片解析失败，请重新选择'))
+    }
+
+    img.src = imageData
+  })
+}
+
+const photoUrl = ref('')
+const photoLoading = ref(false)
+async function getPhoto() {
+  if (photoLoading.value) return
+  console.log("调起微信拍照或相册");
+
+  photoLoading.value = true
+
+  try {
+    // 1. 调起微信拍照或相册
+    const localId = await chooseWechatImage()
+
+    // 2. 获取 Base64 图片数据
+    const localData = await getWechatImageData(localId)
+
+    // 3. 获取图片实际宽高
+    const { width, height } = await getImageDimensions(localData)
+
+    console.log('图片宽度：', width)
+    console.log('图片高度：', height)
+
+    // 4. 检查是否为竖版，并限制最低纵向比例
+    // 要求：图片高度 / 图片宽度 >= 1.2
+    const portraitRatio = height / width
+
+    if (portraitRatio < 1.2) {
+      Toast('请上传竖版照片，建议使用 3:4 或 4:5 比例')
+      return
+    }
+
+    // 5. 检查通过后，直接上传 COS
+    const url = await uploadWechatImageToCOS(localData)
+
+    photoUrl.value = url
+
+    console.log('COS 图片地址：', url)
+
+    // 6. 切换至照片展示页面
+    pageNum.value = 1
+
+    // 等待Vue渲染完照片，再生成合成图
+    await nextTick()
+    await generatePoster()
+    Toast('图片上传成功')
+
+  } catch (error) {
+    console.error('拍照或上传失败：', error)
+
+    const message =
+      error instanceof Error ? error.message : String(error)
+
+    if (!message.includes('取消')) {
+      Toast(message || '获取照片失败，请重试')
+    }
+  } finally {
+    photoLoading.value = false
+  }
+}
+
+/**
+ * 页面初始化时，只初始化一次微信 JSSDK
+ */
+onMounted(async () => {
+  try {
+    await initWechatJSSDK(['chooseImage', 'getLocalImgData'])
+    console.log('微信 JSSDK 初始化完成')
+  } catch (err) {
+    console.error(err)
+    Toast('微信初始化失败')
+  }
+})
+
+// debug
+// 清除用户抽奖信息
+const clearDrawInfo = async () => {
+    return; // 关闭清除用户抽奖信息功能
+    console.log("清除用户信息中..")
+    const res = await clearDrawInfoAPI({ user_id: userInfo.value.user_id })
+    console.log(res)
+    if (res.data.errcode == 0) {
+        console.log("清除成功")
+        // luckyDrawInfo.value = "个人二维码"
+        Toast("用户抽奖信息清除成功！")
+    } else {
+        Toast(res.data.errmsg)
+        console.log("清除失败")
+    }
+}
+
+</script>
+
+<template>
+    <div ref="pageBodyRef" class="page-body">
+      <!-- 已生成合成图片：只显示完整海报 -->
+      <img
+        v-if="posterUrl"
+        class="poster-image"
+        :src="posterUrl"
+        alt="合成海报"
+      />
+      <!-- 尚未生成海报：显示原有页面 -->
+      <template v-else>
+          <!-- 通用内容 -->
+          <div class="slogan-cn"></div>
+          <div v-if="0==pageNum" class="slogan-white" ></div>
+          <div v-else class="slogan-red" ></div>
+          <div class="index-logo" @click="clearDrawInfo"></div>
+          <div v-if="0==pageNum" class="get-photo" @click="getPhoto"></div>
+          <div v-else class="photo-container">
+              <img
+                  :src="photoUrl"
+                  crossorigin="anonymous"
+                  alt="用户上传的照片"
+              />
+          </div>
+          <div v-if="1==pageNum" class="tips"></div>
+          <div class="statement"></div>
+      </template>  
+    </div>
+
+</template>
+
+<style lang="scss" scoped>
+.page-body {
+
+    // 通用设计
+    position: absolute;
+    width: 100vw;
+    height: 100vh;
+    overflow: hidden;
+    // background: url("https://www.mbcstyle.cn/projects/lego/2025/images/bg.jpg") top center no-repeat;
+    // background-size: cover;
+    background-color: black;
+
+    .poster-image {
+        position: absolute;
+        inset: 0;
+
+        display: block;
+        width: 100%;
+        height: 100%;
+
+        object-fit: fill;
+    }
+
+    // 游戏主题
+    .slogan-cn {
+        position: absolute;
+        top: .6rem;
+        margin-left: 50%;
+        transform: translateX(-50%);
+        width: .8733rem;
+        height: .9733rem;
+        background: url("https://www.mbcstyle.cn/projects/static/lego2026ugc/slogan-cn.png") top center no-repeat;
+        background-size: 100% 100%;
+    }
+
+    .slogan-white {
+        position: absolute;
+        top: 1.98rem;
+        margin-left: 50%;
+        transform: translateX(-50%);
+        width: 3.5666rem;
+        height: 4.66rem;
+        background: url("https://www.mbcstyle.cn/projects/static/lego2026ugc/slogan-white.png") top center no-repeat;
+        background-size: 100% 100%;
+    }
+
+    .slogan-red {
+        position: absolute;
+        top: 1.98rem;
+        margin-left: 50%;
+        transform: translateX(-50%);
+        width: 3.5666rem;
+        height: 4.66rem;
+        background: url("https://www.mbcstyle.cn/projects/static/lego2026ugc/slogan-red.png") top center no-repeat;
+        background-size: 100% 100%;
+    }
+
+    // logo加主题
+    .index-logo {
+        position: absolute;
+        top: 7.2rem;
+        margin-left: 50%;
+        transform: translateX(-50%);
+        width: .62rem;
+        height: .6266rem;
+        background: url("https://www.mbcstyle.cn/projects/static/lego2026ugc/logo.jpg") top center no-repeat;
+        background-size: 100% 100%;
+    }
+
+    // 获取照片
+    .get-photo {
+        position: absolute;
+        top: 2.6rem;
+        margin-left: 50%;
+        transform: translateX(-50%);
+        width: 2.5666rem;
+        height: 3.46rem;
+        background: url("https://www.mbcstyle.cn/projects/static/lego2026ugc/get-photo.png") top center no-repeat;
+        background-size: 100% 100%;
+    }
+
+    // 照片展示容器
+    .photo-container {
+        position: absolute;
+        // background-color: skyblue;
+
+        // 根据你的页面设计调整位置
+        top: 2.6rem;
+        left: 50%;
+        transform: translateX(-50%);
+
+        width: 2.5666rem;
+        // height: 4rem;
+
+        // 固定为 3:4 竖版比例
+        aspect-ratio: 3 / 4;
+
+        overflow: hidden;
+        background-color: transparent;
+
+        img {
+            display: block;
+            width: 100%;
+            height: 100%;
+
+            // 保持图片比例，超出容器的部分自动裁剪
+            object-fit: cover;
+            object-position: center;
+            // 避免图片基线或行内元素产生额外空隙
+            // vertical-align: top;
+        }
+    }
+
+    // 免责声明
+    .tips {
+        position: absolute;
+        top: 8.2rem;
+        margin-left: 50%;
+        transform: translateX(-50%);
+        width: 1.1866rem;
+        height: .19333rem;
+        background: url("https://www.mbcstyle.cn/projects/static/lego2026ugc/tips.png") top center no-repeat;
+        background-size: 100% 100%;
+    }
+
+    // 免责声明
+    .statement {
+        position: absolute;
+        bottom: .5rem;
+        margin-left: 50%;
+        transform: translateX(-50%);
+        width: 3.96rem;
+        height: .19333rem;
+        background: url("https://www.mbcstyle.cn/projects/static/lego2026ugc/privacy.png") top center no-repeat;
+        background-size: 100% 100%;
+    }
+    
+}
+</style>
